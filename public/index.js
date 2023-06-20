@@ -13,12 +13,15 @@ socket.on('connection-success', ({ socketId }) => {
 
 let device
 let rtpCapabilities
+let rtpCapabilities2
 let producerTransport
 let consumerTransports = []
 let audioProducer
 let videoProducer
 let consumer
 let isProducer = false
+let OnRouter1 = 1
+let PipeID
 
 // https://mediasoup.org/documentation/v3/mediasoup-client/api/#ProducerOptions
 // https://mediasoup.org/documentation/v3/mediasoup-client/api/#transport-produce
@@ -66,7 +69,9 @@ const joinRoom = () => {
     // we assign to local variable and will be used when
     // loading the client Device (see createDevice above)
     rtpCapabilities = data.rtpCapabilities
-
+    rtpCapabilities2 = data.rtpCapabilities2
+    OnRouter1 = data.selector
+    console.log('joinRoom',OnRouter1)
     // once we have rtpCapabilities from the Router, create Device
     createDevice()
   })
@@ -74,7 +79,7 @@ const joinRoom = () => {
 
 const getLocalStream = () => {
   navigator.mediaDevices.getUserMedia({
-    audio: false, //true
+    audio: false,
     video: {
       width: {
         min: 640,
@@ -120,15 +125,14 @@ const createDevice = async () => {
 const createSendTransport = () => {
   // see server's socket.on('createWebRtcTransport', sender?, ...)
   // this is a call from Producer, so sender = true
-  socket.emit('createWebRtcTransport', { consumer: false }, ({ params }) => {
+  let temp = false
+  socket.emit('createWebRtcTransport', { consumer: temp ,OnRouter:OnRouter1}, ({ params }) => {
     // The server sends back params needed 
     // to create Send Transport on the client side
     if (params.error) {
       console.log(params.error)
       return
     }
-
-    console.log(params)
 
     // creates a new WebRTC Transport to send media
     // based on the server's producer transport params
@@ -155,55 +159,63 @@ const createSendTransport = () => {
     })
 
     producerTransport.on('produce', async (parameters, callback, errback) => {
-      console.log(parameters)
+      console.log('on Produce:',parameters)
 
       try {
         // tell the server to create a Producer
         // with the following parameters and produce
         // and expect back a server side producer id
         // see server's socket.on('transport-produce', ...)
-        await socket.emit('transport-produce', {
+        await socket.emit('transport-produce', { //create producer & add it
           kind: parameters.kind,
           rtpParameters: parameters.rtpParameters,
           appData: parameters.appData,
+          OnRouter: OnRouter1,
+          Dir: temp,
         }, ({ id, producersExist }) => {
           // Tell the transport that parameters were transmitted and provide it with the
           // server side producer's id.
           callback({ id })
 
+          console.log('Start to pipe')
+          PipeID = pipetorouter(id,temp,OnRouter1)
+          console.log('pipe complete')
+          
+          
           // if producers exist, then join room
-          if (producersExist) getProducers()
+          if (producersExist) getProducers(OnRouter1)
         })
       } catch (error) {
         errback(error)
       }
     })
-
-    connectSendTransport()
+   
+    connectSendTransport(OnRouter1)
   })
 }
 
-const connectSendTransport = async () => {
+const connectSendTransport = async (OnRouter) => {
   // we now call produce() to instruct the producer transport
   // to send media to the Router
   // https://mediasoup.org/documentation/v3/mediasoup-client/api/#transport-produce
   // this action will trigger the 'connect' and 'produce' events above
   
-  audioProducer = await producerTransport.produce(audioParams);
+  //audioProducer
+  // audioProducer = await producerTransport.produce(audioParams);
+
+  // audioProducer.on('trackended', () => {
+  //   console.log('audio track ended')
+
+  //   // close audio track
+  // })
+
+  // audioProducer.on('transportclose', () => {
+  //   console.log('audio transport ended')
+
+  //   // close audio track
+  // })
+
   videoProducer = await producerTransport.produce(videoParams);
-
-  audioProducer.on('trackended', () => {
-    console.log('audio track ended')
-
-    // close audio track
-  })
-
-  audioProducer.on('transportclose', () => {
-    console.log('audio transport ended')
-
-    // close audio track
-  })
-  
   videoProducer.on('trackended', () => {
     console.log('video track ended')
 
@@ -215,21 +227,37 @@ const connectSendTransport = async () => {
 
     // close video track
   })
+  console.log('Connect Producer successful')
+
+
+}
+
+const pipetorouter = async (id,consumer,OnRouter)=>{
+  try{
+    console.log('PipeToRouter Dir',consumer,OnRouter)
+    await socket.emit('PipeToRouter',{id,consumer,OnRouter},(PipeID)=>{
+      console.log('Pipe ID:',PipeID)
+      return PipeID
+    })
+  }catch(error){
+    console.log('Pipe To Router error',error)
+  }
 }
 
 const signalNewConsumerTransport = async (remoteProducerId) => {
   //check if we are already consuming the remoteProducerId
   if (consumingTransports.includes(remoteProducerId)) return;
   consumingTransports.push(remoteProducerId);
-
-  await socket.emit('createWebRtcTransport', { consumer: true }, ({ params }) => {
+  var temp = true
+  console.log('signalNewConsumerTransport',OnRouter1)
+  await socket.emit('createWebRtcTransport', { consumer: true ,OnRouter: OnRouter1}, ({ params }) => {
     // The server sends back params needed 
     // to create Send Transport on the client side
     if (params.error) {
       console.log(params.error)
       return
     }
-    console.log(`PARAMS... ${params}`)
+    console.log(`PARAMS... ${params.id}`)
 
     let consumerTransport
     try {
@@ -259,23 +287,24 @@ const signalNewConsumerTransport = async (remoteProducerId) => {
       }
     })
 
-    connectRecvTransport(consumerTransport, remoteProducerId, params.id)
+    connectRecvTransport(consumerTransport, remoteProducerId, params.id,true)
   })
 }
 
 // server informs the client of a new producer just joined
 socket.on('new-producer', ({ producerId }) => signalNewConsumerTransport(producerId))
 
-const getProducers = () => {
-  socket.emit('getProducers', producerIds => {
-    console.log(producerIds)
+const getProducers = async(OnRouter) => {
+  // socket.emit('getProducers', producerIds => {
+  socket.emit('getPipeProducers', producerIds => {
+    console.log('getPipeProducers',producerIds)
     // for each of the producer create a consumer
     // producerIds.forEach(id => signalNewConsumerTransport(id))
-    producerIds.forEach(signalNewConsumerTransport)
+    producerIds.id.forEach(signalNewConsumerTransport)
   })
 }
 
-const connectRecvTransport = async (consumerTransport, remoteProducerId, serverConsumerTransportId) => {
+const connectRecvTransport = async (consumerTransport, remoteProducerId, serverConsumerTransportId,temp) => {
   // for consumer, we need to tell the server first
   // to create a consumer based on the rtpCapabilities and consume
   // if the router can consume, it will send back a set of params as below
@@ -283,6 +312,8 @@ const connectRecvTransport = async (consumerTransport, remoteProducerId, serverC
     rtpCapabilities: device.rtpCapabilities,
     remoteProducerId,
     serverConsumerTransportId,
+    OnRouter: OnRouter1,
+    Dir: temp,
   }, async ({ params }) => {
     if (params.error) {
       console.log('Cannot Consume')
@@ -348,3 +379,6 @@ socket.on('producer-closed', ({ remoteProducerId }) => {
   // remove the video div element
   videoContainer.removeChild(document.getElementById(`td-${remoteProducerId}`))
 })
+function delay(time) {
+  return new Promise(resolve => setTimeout(resolve, time));
+}
