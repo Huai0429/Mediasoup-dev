@@ -64,16 +64,16 @@ let selector = 1
 
 const createWorker = async () => {
   worker = await mediasoup.createWorker({
-    // rtcMinPort: 2000,
-    // rtcMaxPort: 2018,//2020,
+    rtcMinPort: 2000,
+    rtcMaxPort: 2010,//2020,
   })
   worker2 = await mediasoup.createWorker({
-    // rtcMinPort: 3000,
-    // rtcMaxPort: 3018,//3020,
+    rtcMinPort: 3000,
+    rtcMaxPort: 3010,//3020,
   })
   worker3 = await mediasoup.createWorker({
-    // rtcMinPort: 4000,
-    // rtcMaxPort: 4018,//4020,
+    rtcMinPort: 4000,
+    rtcMaxPort: 4010,//4020,
   })
   console.log(`worker pid ${worker.pid},${worker2.pid},${worker3.pid}`)
 
@@ -676,8 +676,8 @@ const createWebRtcTransport = async (router) => {
       const webRtcTransport_options = {
         listenIps: [
           {
-            ip: '127.0.0.1', // replace with relevant IP address
-            announcedIp: '127.0.0.1',
+            ip: '0.0.0.0', // replace with relevant IP address
+            announcedIp: '35.236.182.41',
           }
         ],
         enableUdp: true,
