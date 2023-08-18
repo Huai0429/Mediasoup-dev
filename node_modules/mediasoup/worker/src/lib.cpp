@@ -19,9 +19,7 @@
 #include <uv.h>
 #include <absl/container/flat_hash_map.h>
 #include <cerrno>
-#include <csignal>  // sigaction()
-#include <cstdlib>  // std::_Exit(), std::genenv()
-#include <iostream> // std::cerr, std::endl
+#include <csignal> // sigaction()
 #include <string>
 
 void IgnoreSignals();
@@ -75,7 +73,8 @@ extern "C" int mediasoup_worker_run(
 		DepLibUV::RunLoop();
 		DepLibUV::ClassDestroy();
 
-		return 1;
+		// 40 is a custom exit code to notify "unknown error" to the Node library.
+		return 40;
 	}
 
 	try
@@ -99,7 +98,8 @@ extern "C" int mediasoup_worker_run(
 		DepLibUV::RunLoop();
 		DepLibUV::ClassDestroy();
 
-		return 1;
+		// 40 is a custom exit code to notify "unknown error" to the Node library.
+		return 40;
 	}
 
 	// Initialize the Logger.
@@ -130,7 +130,8 @@ extern "C" int mediasoup_worker_run(
 		DepLibUV::RunLoop();
 		DepLibUV::ClassDestroy();
 
-		return 1;
+		// 40 is a custom exit code to notify "unknown error" to the Node library.
+		return 40;
 	}
 
 	MS_DEBUG_TAG(info, "starting mediasoup-worker process [version:%s]", version);
@@ -193,7 +194,8 @@ extern "C" int mediasoup_worker_run(
 	{
 		MS_ERROR_STD("failure exit: %s", error.what());
 
-		return 1;
+		// 40 is a custom exit code to notify "unknown error" to the Node library.
+		return 40;
 	}
 }
 
@@ -221,7 +223,9 @@ void IgnoreSignals()
 	err            = sigfillset(&act.sa_mask);
 
 	if (err != 0)
+	{
 		MS_THROW_ERROR("sigfillset() failed: %s", std::strerror(errno));
+	}
 
 	for (auto& kv : ignoredSignals)
 	{
@@ -231,7 +235,9 @@ void IgnoreSignals()
 		err = sigaction(sigId, &act, nullptr);
 
 		if (err != 0)
+		{
 			MS_THROW_ERROR("sigaction() failed for signal %s: %s", sigName.c_str(), std::strerror(errno));
+		}
 	}
 #endif
 }
