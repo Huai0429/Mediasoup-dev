@@ -1341,6 +1341,7 @@ const parseuri_js_1 = require("./contrib/parseuri.js");
 const debug_1 = __importDefault(require("debug")); // debug()
 const component_emitter_1 = require("@socket.io/component-emitter");
 const engine_io_parser_1 = require("engine.io-parser");
+const websocket_constructor_js_1 = require("./transports/websocket-constructor.js");
 const debug = (0, debug_1.default)("engine.io-client:socket"); // debug()
 class Socket extends component_emitter_1.Emitter {
     /**
@@ -1351,6 +1352,7 @@ class Socket extends component_emitter_1.Emitter {
      */
     constructor(uri, opts = {}) {
         super();
+        this.binaryType = websocket_constructor_js_1.defaultBinaryType;
         this.writeBuffer = [];
         if (uri && "object" === typeof uri) {
             opts = uri;
@@ -1673,12 +1675,12 @@ class Socket extends component_emitter_1.Emitter {
             this.emitReserved("packet", packet);
             // Socket is live - any packet counts
             this.emitReserved("heartbeat");
+            this.resetPingTimeout();
             switch (packet.type) {
                 case "open":
                     this.onHandshake(JSON.parse(packet.data));
                     break;
                 case "ping":
-                    this.resetPingTimeout();
                     this.sendPacket("pong");
                     this.emitReserved("ping");
                     this.emitReserved("pong");
@@ -1953,7 +1955,7 @@ class Socket extends component_emitter_1.Emitter {
 exports.Socket = Socket;
 Socket.protocol = engine_io_parser_1.protocol;
 
-},{"./contrib/parseqs.js":8,"./contrib/parseuri.js":9,"./transports/index.js":15,"./util.js":21,"@socket.io/component-emitter":1,"debug":22,"engine.io-parser":29}],14:[function(require,module,exports){
+},{"./contrib/parseqs.js":8,"./contrib/parseuri.js":9,"./transports/index.js":15,"./transports/websocket-constructor.js":17,"./util.js":21,"@socket.io/component-emitter":1,"debug":22,"engine.io-parser":29}],14:[function(require,module,exports){
 "use strict";
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
@@ -2611,7 +2613,7 @@ class WS extends transport_js_1.Transport {
         catch (err) {
             return this.emitReserved("error", err);
         }
-        this.ws.binaryType = this.socket.binaryType || websocket_constructor_js_1.defaultBinaryType;
+        this.ws.binaryType = this.socket.binaryType;
         this.addEventListeners();
     }
     /**
@@ -2731,14 +2733,6 @@ const websocket_constructor_js_1 = require("./websocket-constructor.js");
 const engine_io_parser_1 = require("engine.io-parser");
 const debug_1 = __importDefault(require("debug")); // debug()
 const debug = (0, debug_1.default)("engine.io-client:webtransport"); // debug()
-function shouldIncludeBinaryHeader(packet, encoded) {
-    // 48 === "0".charCodeAt(0) (OPEN packet type)
-    // 54 === "6".charCodeAt(0) (NOOP packet type)
-    return (packet.type === "message" &&
-        typeof packet.data !== "string" &&
-        encoded[0] >= 48 &&
-        encoded[0] <= 54);
-}
 class WT extends transport_js_1.Transport {
     get name() {
         return "webtransport";
@@ -2762,9 +2756,11 @@ class WT extends transport_js_1.Transport {
         // note: we could have used async/await, but that would require some additional polyfills
         this.transport.ready.then(() => {
             this.transport.createBidirectionalStream().then((stream) => {
-                const reader = stream.readable.getReader();
-                this.writer = stream.writable.getWriter();
-                let binaryFlag;
+                const decoderStream = (0, engine_io_parser_1.createPacketDecoderStream)(Number.MAX_SAFE_INTEGER, this.socket.binaryType);
+                const reader = stream.readable.pipeThrough(decoderStream).getReader();
+                const encoderStream = (0, engine_io_parser_1.createPacketEncoderStream)();
+                encoderStream.readable.pipeTo(stream.writable);
+                this.writer = encoderStream.writable.getWriter();
                 const read = () => {
                     reader
                         .read()
@@ -2774,14 +2770,7 @@ class WT extends transport_js_1.Transport {
                             return;
                         }
                         debug("received chunk: %o", value);
-                        if (!binaryFlag && value.byteLength === 1 && value[0] === 54) {
-                            binaryFlag = true;
-                        }
-                        else {
-                            // TODO expose binarytype
-                            this.onPacket((0, engine_io_parser_1.decodePacketFromBinary)(value, binaryFlag, "arraybuffer"));
-                            binaryFlag = false;
-                        }
+                        this.onPacket(value);
                         read();
                     })
                         .catch((err) => {
@@ -2789,10 +2778,11 @@ class WT extends transport_js_1.Transport {
                     });
                 };
                 read();
-                const handshake = this.query.sid ? `0{"sid":"${this.query.sid}"}` : "0";
-                this.writer
-                    .write(new TextEncoder().encode(handshake))
-                    .then(() => this.onOpen());
+                const packet = { type: "open" };
+                if (this.query.sid) {
+                    packet.data = `{"sid":"${this.query.sid}"}`;
+                }
+                this.writer.write(packet).then(() => this.onOpen());
             });
         });
     }
@@ -2801,20 +2791,13 @@ class WT extends transport_js_1.Transport {
         for (let i = 0; i < packets.length; i++) {
             const packet = packets[i];
             const lastPacket = i === packets.length - 1;
-            (0, engine_io_parser_1.encodePacketToBinary)(packet, (data) => {
-                if (shouldIncludeBinaryHeader(packet, data)) {
-                    debug("writing binary header");
-                    this.writer.write(Uint8Array.of(54));
+            this.writer.write(packet).then(() => {
+                if (lastPacket) {
+                    (0, websocket_constructor_js_1.nextTick)(() => {
+                        this.writable = true;
+                        this.emitReserved("drain");
+                    }, this.setTimeoutFn);
                 }
-                debug("writing chunk: %o", data);
-                this.writer.write(data).then(() => {
-                    if (lastPacket) {
-                        (0, websocket_constructor_js_1.nextTick)(() => {
-                            this.writable = true;
-                            this.emitReserved("drain");
-                        }, this.setTimeoutFn);
-                    }
-                });
             });
         }
     }
@@ -3137,12 +3120,12 @@ exports.encodePacketToBinary = encodePacketToBinary;
 },{"./commons.js":25}],29:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.decodePayload = exports.decodePacket = exports.encodePayload = exports.encodePacketToBinary = exports.encodePacket = exports.protocol = exports.decodePacketFromBinary = void 0;
+exports.decodePayload = exports.decodePacket = exports.encodePayload = exports.encodePacket = exports.protocol = exports.createPacketDecoderStream = exports.createPacketEncoderStream = void 0;
 const encodePacket_js_1 = require("./encodePacket.js");
 Object.defineProperty(exports, "encodePacket", { enumerable: true, get: function () { return encodePacket_js_1.encodePacket; } });
-Object.defineProperty(exports, "encodePacketToBinary", { enumerable: true, get: function () { return encodePacket_js_1.encodePacketToBinary; } });
 const decodePacket_js_1 = require("./decodePacket.js");
 Object.defineProperty(exports, "decodePacket", { enumerable: true, get: function () { return decodePacket_js_1.decodePacket; } });
+const commons_js_1 = require("./commons.js");
 const SEPARATOR = String.fromCharCode(30); // see https://en.wikipedia.org/wiki/Delimiter#ASCII_delimited_text
 const encodePayload = (packets, callback) => {
     // some packets may be added to the array while encoding, so the initial length must be saved
@@ -3173,21 +3156,134 @@ const decodePayload = (encodedPayload, binaryType) => {
     return packets;
 };
 exports.decodePayload = decodePayload;
+function createPacketEncoderStream() {
+    return new TransformStream({
+        transform(packet, controller) {
+            (0, encodePacket_js_1.encodePacketToBinary)(packet, encodedPacket => {
+                const payloadLength = encodedPacket.length;
+                let header;
+                // inspired by the WebSocket format: https://developer.mozilla.org/en-US/docs/Web/API/WebSockets_API/Writing_WebSocket_servers#decoding_payload_length
+                if (payloadLength < 126) {
+                    header = new Uint8Array(1);
+                    new DataView(header.buffer).setUint8(0, payloadLength);
+                }
+                else if (payloadLength < 65536) {
+                    header = new Uint8Array(3);
+                    const view = new DataView(header.buffer);
+                    view.setUint8(0, 126);
+                    view.setUint16(1, payloadLength);
+                }
+                else {
+                    header = new Uint8Array(9);
+                    const view = new DataView(header.buffer);
+                    view.setUint8(0, 127);
+                    view.setBigUint64(1, BigInt(payloadLength));
+                }
+                // first bit indicates whether the payload is plain text (0) or binary (1)
+                if (packet.data && typeof packet.data !== "string") {
+                    header[0] |= 0x80;
+                }
+                controller.enqueue(header);
+                controller.enqueue(encodedPacket);
+            });
+        }
+    });
+}
+exports.createPacketEncoderStream = createPacketEncoderStream;
 let TEXT_DECODER;
-function decodePacketFromBinary(data, isBinary, binaryType) {
+function totalLength(chunks) {
+    return chunks.reduce((acc, chunk) => acc + chunk.length, 0);
+}
+function concatChunks(chunks, size) {
+    if (chunks[0].length === size) {
+        return chunks.shift();
+    }
+    const buffer = new Uint8Array(size);
+    let j = 0;
+    for (let i = 0; i < size; i++) {
+        buffer[i] = chunks[0][j++];
+        if (j === chunks[0].length) {
+            chunks.shift();
+            j = 0;
+        }
+    }
+    if (chunks.length && j < chunks[0].length) {
+        chunks[0] = chunks[0].slice(j);
+    }
+    return buffer;
+}
+function createPacketDecoderStream(maxPayload, binaryType) {
     if (!TEXT_DECODER) {
-        // lazily created for compatibility with old browser platforms
         TEXT_DECODER = new TextDecoder();
     }
-    // 48 === "0".charCodeAt(0) (OPEN packet type)
-    // 54 === "6".charCodeAt(0) (NOOP packet type)
-    const isPlainBinary = isBinary || data[0] < 48 || data[0] > 54;
-    return (0, decodePacket_js_1.decodePacket)(isPlainBinary ? data : TEXT_DECODER.decode(data), binaryType);
+    const chunks = [];
+    let state = 0 /* READ_HEADER */;
+    let expectedLength = -1;
+    let isBinary = false;
+    return new TransformStream({
+        transform(chunk, controller) {
+            chunks.push(chunk);
+            while (true) {
+                if (state === 0 /* READ_HEADER */) {
+                    if (totalLength(chunks) < 1) {
+                        break;
+                    }
+                    const header = concatChunks(chunks, 1);
+                    isBinary = (header[0] & 0x80) === 0x80;
+                    expectedLength = header[0] & 0x7f;
+                    if (expectedLength < 126) {
+                        state = 3 /* READ_PAYLOAD */;
+                    }
+                    else if (expectedLength === 126) {
+                        state = 1 /* READ_EXTENDED_LENGTH_16 */;
+                    }
+                    else {
+                        state = 2 /* READ_EXTENDED_LENGTH_64 */;
+                    }
+                }
+                else if (state === 1 /* READ_EXTENDED_LENGTH_16 */) {
+                    if (totalLength(chunks) < 2) {
+                        break;
+                    }
+                    const headerArray = concatChunks(chunks, 2);
+                    expectedLength = new DataView(headerArray.buffer, headerArray.byteOffset, headerArray.length).getUint16(0);
+                    state = 3 /* READ_PAYLOAD */;
+                }
+                else if (state === 2 /* READ_EXTENDED_LENGTH_64 */) {
+                    if (totalLength(chunks) < 8) {
+                        break;
+                    }
+                    const headerArray = concatChunks(chunks, 8);
+                    const view = new DataView(headerArray.buffer, headerArray.byteOffset, headerArray.length);
+                    const n = view.getUint32(0);
+                    if (n > Math.pow(2, 53 - 32) - 1) {
+                        // the maximum safe integer in JavaScript is 2^53 - 1
+                        controller.enqueue(commons_js_1.ERROR_PACKET);
+                        break;
+                    }
+                    expectedLength = n * Math.pow(2, 32) + view.getUint32(4);
+                    state = 3 /* READ_PAYLOAD */;
+                }
+                else {
+                    if (totalLength(chunks) < expectedLength) {
+                        break;
+                    }
+                    const data = concatChunks(chunks, expectedLength);
+                    controller.enqueue((0, decodePacket_js_1.decodePacket)(isBinary ? data : TEXT_DECODER.decode(data), binaryType));
+                    state = 0 /* READ_HEADER */;
+                }
+                if (expectedLength === 0 || expectedLength > maxPayload) {
+                    controller.enqueue(commons_js_1.ERROR_PACKET);
+                    break;
+                }
+            }
+        }
+    });
 }
-exports.decodePacketFromBinary = decodePacketFromBinary;
+exports.createPacketDecoderStream = createPacketDecoderStream;
 exports.protocol = 4;
 
-},{"./decodePacket.js":27,"./encodePacket.js":28}],30:[function(require,module,exports){
+},{"./commons.js":25,"./decodePacket.js":27,"./encodePacket.js":28}],30:[function(require,module,exports){
 const debug = require('debug')('h264-profile-level-id');
 
 /* eslint-disable no-console */
@@ -5119,6 +5215,8 @@ class Transport extends EnhancedEventEmitter_1.EnhancedEventEmitter {
         super();
         // Closed flag.
         this._closed = false;
+        // Transport ICE gathering state.
+        this._iceGatheringState = 'new';
         // Transport connection state.
         this._connectionState = 'new';
         // Map of Producers indexed by id.
@@ -5206,6 +5304,12 @@ class Transport extends EnhancedEventEmitter_1.EnhancedEventEmitter {
         return this._handler;
     }
     /**
+     * ICE gathering state.
+     */
+    get iceGatheringState() {
+        return this._iceGatheringState;
+    }
+    /**
      * Connection state.
      */
     get connectionState() {
@@ -5239,6 +5343,9 @@ class Transport extends EnhancedEventEmitter_1.EnhancedEventEmitter {
         this._awaitQueue.stop();
         // Close the handler.
         this._handler.close();
+        // Change connection state to 'closed' since the handler may not emit
+        // '@connectionstatechange' event.
+        this._connectionState = 'closed';
         // Close all Producers.
         for (const producer of this._producers.values()) {
             producer.transportClosed();
@@ -5285,7 +5392,7 @@ class Transport extends EnhancedEventEmitter_1.EnhancedEventEmitter {
             throw new TypeError('missing iceParameters');
         }
         // Enqueue command.
-        return this._awaitQueue.push(async () => this._handler.restartIce(iceParameters), 'transport.restartIce()');
+        return this._awaitQueue.push(async () => await this._handler.restartIce(iceParameters), 'transport.restartIce()');
     }
     /**
      * Update ICE servers.
@@ -5764,6 +5871,16 @@ class Transport extends EnhancedEventEmitter_1.EnhancedEventEmitter {
             }
             this.safeEmit('connect', { dtlsParameters }, callback, errback);
         });
+        handler.on('@icegatheringstatechange', (iceGatheringState) => {
+            if (iceGatheringState === this._iceGatheringState) {
+                return;
+            }
+            logger.debug('ICE gathering state changed to %s', iceGatheringState);
+            this._iceGatheringState = iceGatheringState;
+            if (!this._closed) {
+                this.safeEmit('icegatheringstatechange', iceGatheringState);
+            }
+        });
         handler.on('@connectionstatechange', (connectionState) => {
             if (connectionState === this._connectionState) {
                 return;
@@ -5781,31 +5898,31 @@ class Transport extends EnhancedEventEmitter_1.EnhancedEventEmitter {
             if (this._closed) {
                 return;
             }
-            this._awaitQueue.push(async () => this._handler.stopSending(producer.localId), 'producer @close event')
+            this._awaitQueue.push(async () => await this._handler.stopSending(producer.localId), 'producer @close event')
                 .catch((error) => logger.warn('producer.close() failed:%o', error));
         });
         producer.on('@pause', (callback, errback) => {
-            this._awaitQueue.push(async () => this._handler.pauseSending(producer.localId), 'producer @pause event')
+            this._awaitQueue.push(async () => await this._handler.pauseSending(producer.localId), 'producer @pause event')
                 .then(callback)
                 .catch(errback);
         });
         producer.on('@resume', (callback, errback) => {
-            this._awaitQueue.push(async () => this._handler.resumeSending(producer.localId), 'producer @resume event')
+            this._awaitQueue.push(async () => await this._handler.resumeSending(producer.localId), 'producer @resume event')
                 .then(callback)
                 .catch(errback);
         });
         producer.on('@replacetrack', (track, callback, errback) => {
-            this._awaitQueue.push(async () => this._handler.replaceTrack(producer.localId, track), 'producer @replacetrack event')
+            this._awaitQueue.push(async () => await this._handler.replaceTrack(producer.localId, track), 'producer @replacetrack event')
                 .then(callback)
                 .catch(errback);
         });
         producer.on('@setmaxspatiallayer', (spatialLayer, callback, errback) => {
-            this._awaitQueue.push(async () => (this._handler.setMaxSpatialLayer(producer.localId, spatialLayer)), 'producer @setmaxspatiallayer event')
+            this._awaitQueue.push(async () => (await this._handler.setMaxSpatialLayer(producer.localId, spatialLayer)), 'producer @setmaxspatiallayer event')
                 .then(callback)
                 .catch(errback);
         });
         producer.on('@setrtpencodingparameters', (params, callback, errback) => {
-            this._awaitQueue.push(async () => (this._handler.setRtpEncodingParameters(producer.localId, params)), 'producer @setrtpencodingparameters event')
+            this._awaitQueue.push(async () => (await this._handler.setRtpEncodingParameters(producer.localId, params)), 'producer @setrtpencodingparameters event')
                 .then(callback)
                 .catch(errback);
         });
@@ -5964,6 +6081,7 @@ const ortc = __importStar(require("../ortc"));
 const sdpCommonUtils = __importStar(require("./sdp/commonUtils"));
 const sdpUnifiedPlanUtils = __importStar(require("./sdp/unifiedPlanUtils"));
 const ortcUtils = __importStar(require("./ortc/utils"));
+const errors_1 = require("../errors");
 const HandlerInterface_1 = require("./HandlerInterface");
 const RemoteSdp_1 = require("./sdp/RemoteSdp");
 const scalabilityModes_1 = require("../scalabilityModes");
@@ -5978,6 +6096,8 @@ class Chrome111 extends HandlerInterface_1.HandlerInterface {
     }
     constructor() {
         super();
+        // Closed flag.
+        this._closed = false;
         // Map of RTCTransceivers indexed by MID.
         this._mapMidTransceiver = new Map();
         // Local stream for sending.
@@ -5994,6 +6114,10 @@ class Chrome111 extends HandlerInterface_1.HandlerInterface {
     }
     close() {
         logger.debug('close()');
+        if (this._closed) {
+            return;
+        }
+        this._closed = true;
         // Close RTCPeerConnection.
         if (this._pc) {
             try {
@@ -6041,6 +6165,7 @@ class Chrome111 extends HandlerInterface_1.HandlerInterface {
         };
     }
     run({ direction, iceParameters, iceCandidates, dtlsParameters, sctpParameters, iceServers, iceTransportPolicy, additionalSettings, proprietaryConstraints, extendedRtpCapabilities }) {
+        this.assertNotClosed();
         logger.debug('run()');
         this._direction = direction;
         this._remoteSdp = new RemoteSdp_1.RemoteSdp({
@@ -6072,6 +6197,9 @@ class Chrome111 extends HandlerInterface_1.HandlerInterface {
             sdpSemantics: 'unified-plan',
             ...additionalSettings
         }, proprietaryConstraints);
+        this._pc.addEventListener('icegatheringstatechange', () => {
+            this.emit('@icegatheringstatechange', this._pc.iceGatheringState);
+        });
         if (this._pc.connectionState) {
             this._pc.addEventListener('connectionstatechange', () => {
                 this.emit('@connectionstatechange', this._pc.connectionState);
@@ -6102,12 +6230,14 @@ class Chrome111 extends HandlerInterface_1.HandlerInterface {
         }
     }
     async updateIceServers(iceServers) {
+        this.assertNotClosed();
         logger.debug('updateIceServers()');
         const configuration = this._pc.getConfiguration();
         configuration.iceServers = iceServers;
         this._pc.setConfiguration(configuration);
     }
     async restartIce(iceParameters) {
+        this.assertNotClosed();
         logger.debug('restartIce()');
         // Provide the remote SDP handler with new remote ICE parameters.
         this._remoteSdp.updateIceParameters(iceParameters);
@@ -6132,9 +6262,11 @@ class Chrome111 extends HandlerInterface_1.HandlerInterface {
         }
     }
     async getTransportStats() {
+        this.assertNotClosed();
         return this._pc.getStats();
     }
     async send({ track, encodings, codecOptions, codec }) {
+        this.assertNotClosed();
         this.assertSendDirection();
         logger.debug('send() [kind:%s, track.id:%s]', track.kind, track.id);
         if (encodings && encodings.length > 1) {
@@ -6232,6 +6364,9 @@ class Chrome111 extends HandlerInterface_1.HandlerInterface {
     async stopSending(localId) {
         this.assertSendDirection();
         logger.debug('stopSending() [localId:%s]', localId);
+        if (this._closed) {
+            return;
+        }
         const transceiver = this._mapMidTransceiver.get(localId);
         if (!transceiver) {
             throw new Error('associated RTCRtpTransceiver not found');
@@ -6254,6 +6389,7 @@ class Chrome111 extends HandlerInterface_1.HandlerInterface {
         this._mapMidTransceiver.delete(localId);
     }
     async pauseSending(localId) {
+        this.assertNotClosed();
         this.assertSendDirection();
         logger.debug('pauseSending() [localId:%s]', localId);
         const transceiver = this._mapMidTransceiver.get(localId);
@@ -6270,6 +6406,7 @@ class Chrome111 extends HandlerInterface_1.HandlerInterface {
         await this._pc.setRemoteDescription(answer);
     }
     async resumeSending(localId) {
+        this.assertNotClosed();
         this.assertSendDirection();
         logger.debug('resumeSending() [localId:%s]', localId);
         const transceiver = this._mapMidTransceiver.get(localId);
@@ -6286,6 +6423,7 @@ class Chrome111 extends HandlerInterface_1.HandlerInterface {
         await this._pc.setRemoteDescription(answer);
     }
     async replaceTrack(localId, track) {
+        this.assertNotClosed();
         this.assertSendDirection();
         if (track) {
             logger.debug('replaceTrack() [localId:%s, track.id:%s]', localId, track.id);
@@ -6300,6 +6438,7 @@ class Chrome111 extends HandlerInterface_1.HandlerInterface {
         await transceiver.sender.replaceTrack(track);
     }
     async setMaxSpatialLayer(localId, spatialLayer) {
+        this.assertNotClosed();
         this.assertSendDirection();
         logger.debug('setMaxSpatialLayer() [localId:%s, spatialLayer:%s]', localId, spatialLayer);
         const transceiver = this._mapMidTransceiver.get(localId);
@@ -6325,6 +6464,7 @@ class Chrome111 extends HandlerInterface_1.HandlerInterface {
         await this._pc.setRemoteDescription(answer);
     }
     async setRtpEncodingParameters(localId, params) {
+        this.assertNotClosed();
         this.assertSendDirection();
         logger.debug('setRtpEncodingParameters() [localId:%s, params:%o]', localId, params);
         const transceiver = this._mapMidTransceiver.get(localId);
@@ -6345,6 +6485,7 @@ class Chrome111 extends HandlerInterface_1.HandlerInterface {
         await this._pc.setRemoteDescription(answer);
     }
     async getSenderStats(localId) {
+        this.assertNotClosed();
         this.assertSendDirection();
         const transceiver = this._mapMidTransceiver.get(localId);
         if (!transceiver) {
@@ -6353,6 +6494,7 @@ class Chrome111 extends HandlerInterface_1.HandlerInterface {
         return transceiver.sender.getStats();
     }
     async sendDataChannel({ ordered, maxPacketLifeTime, maxRetransmits, label, protocol }) {
+        this.assertNotClosed();
         this.assertSendDirection();
         const options = {
             negotiated: true,
@@ -6397,6 +6539,7 @@ class Chrome111 extends HandlerInterface_1.HandlerInterface {
         return { dataChannel, sctpStreamParameters };
     }
     async receive(optionsList) {
+        this.assertNotClosed();
         this.assertRecvDirection();
         const results = [];
         const mapLocalId = new Map();
@@ -6461,6 +6604,9 @@ class Chrome111 extends HandlerInterface_1.HandlerInterface {
     }
     async stopReceiving(localIds) {
         this.assertRecvDirection();
+        if (this._closed) {
+            return;
+        }
         for (const localId of localIds) {
             logger.debug('stopReceiving() [localId:%s]', localId);
             const transceiver = this._mapMidTransceiver.get(localId);
@@ -6480,6 +6626,7 @@ class Chrome111 extends HandlerInterface_1.HandlerInterface {
         }
     }
     async pauseReceiving(localIds) {
+        this.assertNotClosed();
         this.assertRecvDirection();
         for (const localId of localIds) {
             logger.debug('pauseReceiving() [localId:%s]', localId);
@@ -6498,6 +6645,7 @@ class Chrome111 extends HandlerInterface_1.HandlerInterface {
         await this._pc.setLocalDescription(answer);
     }
     async resumeReceiving(localIds) {
+        this.assertNotClosed();
         this.assertRecvDirection();
         for (const localId of localIds) {
             logger.debug('resumeReceiving() [localId:%s]', localId);
@@ -6516,6 +6664,7 @@ class Chrome111 extends HandlerInterface_1.HandlerInterface {
         await this._pc.setLocalDescription(answer);
     }
     async getReceiverStats(localId) {
+        this.assertNotClosed();
         this.assertRecvDirection();
         const transceiver = this._mapMidTransceiver.get(localId);
         if (!transceiver) {
@@ -6524,6 +6673,7 @@ class Chrome111 extends HandlerInterface_1.HandlerInterface {
         return transceiver.receiver.getStats();
     }
     async receiveDataChannel({ sctpStreamParameters, label, protocol }) {
+        this.assertNotClosed();
         this.assertRecvDirection();
         const { streamId, ordered, maxPacketLifeTime, maxRetransmits } = sctpStreamParameters;
         const options = {
@@ -6573,6 +6723,11 @@ class Chrome111 extends HandlerInterface_1.HandlerInterface {
         });
         this._transportReady = true;
     }
+    assertNotClosed() {
+        if (this._closed) {
+            throw new errors_1.InvalidStateError('method called in a closed handler');
+        }
+    }
     assertSendDirection() {
         if (this._direction !== 'send') {
             throw new Error('method can just be called for handlers with "send" direction');
@@ -6586,7 +6741,7 @@ class Chrome111 extends HandlerInterface_1.HandlerInterface {
 }
 exports.Chrome111 = Chrome111;
 
-},{"../Logger":39,"../ortc":65,"../scalabilityModes":66,"../utils":68,"./HandlerInterface":52,"./ortc/utils":58,"./sdp/RemoteSdp":60,"./sdp/commonUtils":61,"./sdp/unifiedPlanUtils":63,"sdp-transform":74}],46:[function(require,module,exports){
+},{"../Logger":39,"../errors":44,"../ortc":65,"../scalabilityModes":66,"../utils":68,"./HandlerInterface":52,"./ortc/utils":58,"./sdp/RemoteSdp":60,"./sdp/commonUtils":61,"./sdp/unifiedPlanUtils":63,"sdp-transform":74}],46:[function(require,module,exports){
 "use strict";
 var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
@@ -6732,6 +6887,9 @@ class Chrome55 extends HandlerInterface_1.HandlerInterface {
             sdpSemantics: 'plan-b',
             ...additionalSettings
         }, proprietaryConstraints);
+        this._pc.addEventListener('icegatheringstatechange', () => {
+            this.emit('@icegatheringstatechange', this._pc.iceGatheringState);
+        });
         if (this._pc.connectionState) {
             this._pc.addEventListener('connectionstatechange', () => {
                 this.emit('@connectionstatechange', this._pc.connectionState);
@@ -7271,6 +7429,9 @@ class Chrome67 extends HandlerInterface_1.HandlerInterface {
             sdpSemantics: 'plan-b',
             ...additionalSettings
         }, proprietaryConstraints);
+        this._pc.addEventListener('icegatheringstatechange', () => {
+            this.emit('@icegatheringstatechange', this._pc.iceGatheringState);
+        });
         if (this._pc.connectionState) {
             this._pc.addEventListener('connectionstatechange', () => {
                 this.emit('@connectionstatechange', this._pc.connectionState);
@@ -7861,6 +8022,9 @@ class Chrome70 extends HandlerInterface_1.HandlerInterface {
             sdpSemantics: 'unified-plan',
             ...additionalSettings
         }, proprietaryConstraints);
+        this._pc.addEventListener('icegatheringstatechange', () => {
+            this.emit('@icegatheringstatechange', this._pc.iceGatheringState);
+        });
         if (this._pc.connectionState) {
             this._pc.addEventListener('connectionstatechange', () => {
                 this.emit('@connectionstatechange', this._pc.connectionState);
@@ -8381,6 +8545,7 @@ const ortc = __importStar(require("../ortc"));
 const sdpCommonUtils = __importStar(require("./sdp/commonUtils"));
 const sdpUnifiedPlanUtils = __importStar(require("./sdp/unifiedPlanUtils"));
 const ortcUtils = __importStar(require("./ortc/utils"));
+const errors_1 = require("../errors");
 const HandlerInterface_1 = require("./HandlerInterface");
 const RemoteSdp_1 = require("./sdp/RemoteSdp");
 const scalabilityModes_1 = require("../scalabilityModes");
@@ -8395,6 +8560,8 @@ class Chrome74 extends HandlerInterface_1.HandlerInterface {
     }
     constructor() {
         super();
+        // Closed flag.
+        this._closed = false;
         // Map of RTCTransceivers indexed by MID.
         this._mapMidTransceiver = new Map();
         // Local stream for sending.
@@ -8411,6 +8578,10 @@ class Chrome74 extends HandlerInterface_1.HandlerInterface {
     }
     close() {
         logger.debug('close()');
+        if (this._closed) {
+            return;
+        }
+        this._closed = true;
         // Close RTCPeerConnection.
         if (this._pc) {
             try {
@@ -8489,6 +8660,9 @@ class Chrome74 extends HandlerInterface_1.HandlerInterface {
             sdpSemantics: 'unified-plan',
             ...additionalSettings
         }, proprietaryConstraints);
+        this._pc.addEventListener('icegatheringstatechange', () => {
+            this.emit('@icegatheringstatechange', this._pc.iceGatheringState);
+        });
         if (this._pc.connectionState) {
             this._pc.addEventListener('connectionstatechange', () => {
                 this.emit('@connectionstatechange', this._pc.connectionState);
@@ -8519,12 +8693,14 @@ class Chrome74 extends HandlerInterface_1.HandlerInterface {
         }
     }
     async updateIceServers(iceServers) {
+        this.assertNotClosed();
         logger.debug('updateIceServers()');
         const configuration = this._pc.getConfiguration();
         configuration.iceServers = iceServers;
         this._pc.setConfiguration(configuration);
     }
     async restartIce(iceParameters) {
+        this.assertNotClosed();
         logger.debug('restartIce()');
         // Provide the remote SDP handler with new remote ICE parameters.
         this._remoteSdp.updateIceParameters(iceParameters);
@@ -8549,9 +8725,11 @@ class Chrome74 extends HandlerInterface_1.HandlerInterface {
         }
     }
     async getTransportStats() {
+        this.assertNotClosed();
         return this._pc.getStats();
     }
     async send({ track, encodings, codecOptions, codec }) {
+        this.assertNotClosed();
         this.assertSendDirection();
         logger.debug('send() [kind:%s, track.id:%s]', track.kind, track.id);
         if (encodings && encodings.length > 1) {
@@ -8666,6 +8844,9 @@ class Chrome74 extends HandlerInterface_1.HandlerInterface {
     async stopSending(localId) {
         this.assertSendDirection();
         logger.debug('stopSending() [localId:%s]', localId);
+        if (this._closed) {
+            return;
+        }
         const transceiver = this._mapMidTransceiver.get(localId);
         if (!transceiver) {
             throw new Error('associated RTCRtpTransceiver not found');
@@ -8688,6 +8869,7 @@ class Chrome74 extends HandlerInterface_1.HandlerInterface {
         this._mapMidTransceiver.delete(localId);
     }
     async pauseSending(localId) {
+        this.assertNotClosed();
         this.assertSendDirection();
         logger.debug('pauseSending() [localId:%s]', localId);
         const transceiver = this._mapMidTransceiver.get(localId);
@@ -8704,6 +8886,7 @@ class Chrome74 extends HandlerInterface_1.HandlerInterface {
         await this._pc.setRemoteDescription(answer);
     }
     async resumeSending(localId) {
+        this.assertNotClosed();
         this.assertSendDirection();
         logger.debug('resumeSending() [localId:%s]', localId);
         const transceiver = this._mapMidTransceiver.get(localId);
@@ -8720,6 +8903,7 @@ class Chrome74 extends HandlerInterface_1.HandlerInterface {
         await this._pc.setRemoteDescription(answer);
     }
     async replaceTrack(localId, track) {
+        this.assertNotClosed();
         this.assertSendDirection();
         if (track) {
             logger.debug('replaceTrack() [localId:%s, track.id:%s]', localId, track.id);
@@ -8734,6 +8918,7 @@ class Chrome74 extends HandlerInterface_1.HandlerInterface {
         await transceiver.sender.replaceTrack(track);
     }
     async setMaxSpatialLayer(localId, spatialLayer) {
+        this.assertNotClosed();
         this.assertSendDirection();
         logger.debug('setMaxSpatialLayer() [localId:%s, spatialLayer:%s]', localId, spatialLayer);
         const transceiver = this._mapMidTransceiver.get(localId);
@@ -8759,6 +8944,7 @@ class Chrome74 extends HandlerInterface_1.HandlerInterface {
         await this._pc.setRemoteDescription(answer);
     }
     async setRtpEncodingParameters(localId, params) {
+        this.assertNotClosed();
         this.assertSendDirection();
         logger.debug('setRtpEncodingParameters() [localId:%s, params:%o]', localId, params);
         const transceiver = this._mapMidTransceiver.get(localId);
@@ -8779,6 +8965,7 @@ class Chrome74 extends HandlerInterface_1.HandlerInterface {
         await this._pc.setRemoteDescription(answer);
     }
     async getSenderStats(localId) {
+        this.assertNotClosed();
         this.assertSendDirection();
         const transceiver = this._mapMidTransceiver.get(localId);
         if (!transceiver) {
@@ -8787,6 +8974,7 @@ class Chrome74 extends HandlerInterface_1.HandlerInterface {
         return transceiver.sender.getStats();
     }
     async sendDataChannel({ ordered, maxPacketLifeTime, maxRetransmits, label, protocol }) {
+        this.assertNotClosed();
         this.assertSendDirection();
         const options = {
             negotiated: true,
@@ -8831,6 +9019,7 @@ class Chrome74 extends HandlerInterface_1.HandlerInterface {
         return { dataChannel, sctpStreamParameters };
     }
     async receive(optionsList) {
+        this.assertNotClosed();
         this.assertRecvDirection();
         const results = [];
         const mapLocalId = new Map();
@@ -8895,6 +9084,9 @@ class Chrome74 extends HandlerInterface_1.HandlerInterface {
     }
     async stopReceiving(localIds) {
         this.assertRecvDirection();
+        if (this._closed) {
+            return;
+        }
         for (const localId of localIds) {
             logger.debug('stopReceiving() [localId:%s]', localId);
             const transceiver = this._mapMidTransceiver.get(localId);
@@ -8914,6 +9106,7 @@ class Chrome74 extends HandlerInterface_1.HandlerInterface {
         }
     }
     async pauseReceiving(localIds) {
+        this.assertNotClosed();
         this.assertRecvDirection();
         for (const localId of localIds) {
             logger.debug('pauseReceiving() [localId:%s]', localId);
@@ -8932,6 +9125,7 @@ class Chrome74 extends HandlerInterface_1.HandlerInterface {
         await this._pc.setLocalDescription(answer);
     }
     async resumeReceiving(localIds) {
+        this.assertNotClosed();
         this.assertRecvDirection();
         for (const localId of localIds) {
             logger.debug('resumeReceiving() [localId:%s]', localId);
@@ -8950,6 +9144,7 @@ class Chrome74 extends HandlerInterface_1.HandlerInterface {
         await this._pc.setLocalDescription(answer);
     }
     async getReceiverStats(localId) {
+        this.assertNotClosed();
         this.assertRecvDirection();
         const transceiver = this._mapMidTransceiver.get(localId);
         if (!transceiver) {
@@ -8958,6 +9153,7 @@ class Chrome74 extends HandlerInterface_1.HandlerInterface {
         return transceiver.receiver.getStats();
     }
     async receiveDataChannel({ sctpStreamParameters, label, protocol }) {
+        this.assertNotClosed();
         this.assertRecvDirection();
         const { streamId, ordered, maxPacketLifeTime, maxRetransmits } = sctpStreamParameters;
         const options = {
@@ -9007,6 +9203,11 @@ class Chrome74 extends HandlerInterface_1.HandlerInterface {
         });
         this._transportReady = true;
     }
+    assertNotClosed() {
+        if (this._closed) {
+            throw new errors_1.InvalidStateError('method called in a closed handler');
+        }
+    }
     assertSendDirection() {
         if (this._direction !== 'send') {
             throw new Error('method can just be called for handlers with "send" direction');
@@ -9020,7 +9221,7 @@ class Chrome74 extends HandlerInterface_1.HandlerInterface {
 }
 exports.Chrome74 = Chrome74;
 
-},{"../Logger":39,"../ortc":65,"../scalabilityModes":66,"../utils":68,"./HandlerInterface":52,"./ortc/utils":58,"./sdp/RemoteSdp":60,"./sdp/commonUtils":61,"./sdp/unifiedPlanUtils":63,"sdp-transform":74}],50:[function(require,module,exports){
+},{"../Logger":39,"../errors":44,"../ortc":65,"../scalabilityModes":66,"../utils":68,"./HandlerInterface":52,"./ortc/utils":58,"./sdp/RemoteSdp":60,"./sdp/commonUtils":61,"./sdp/unifiedPlanUtils":63,"sdp-transform":74}],50:[function(require,module,exports){
 "use strict";
 var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
@@ -9517,6 +9718,8 @@ class Firefox60 extends HandlerInterface_1.HandlerInterface {
     }
     constructor() {
         super();
+        // Closed flag.
+        this._closed = false;
         // Map of RTCTransceivers indexed by MID.
         this._mapMidTransceiver = new Map();
         // Local stream for sending.
@@ -9533,6 +9736,10 @@ class Firefox60 extends HandlerInterface_1.HandlerInterface {
     }
     close() {
         logger.debug('close()');
+        if (this._closed) {
+            return;
+        }
+        this._closed = true;
         // Close RTCPeerConnection.
         if (this._pc) {
             try {
@@ -9606,6 +9813,7 @@ class Firefox60 extends HandlerInterface_1.HandlerInterface {
         };
     }
     run({ direction, iceParameters, iceCandidates, dtlsParameters, sctpParameters, iceServers, iceTransportPolicy, additionalSettings, proprietaryConstraints, extendedRtpCapabilities }) {
+        this.assertNotClosed();
         logger.debug('run()');
         this._direction = direction;
         this._remoteSdp = new RemoteSdp_1.RemoteSdp({
@@ -9631,6 +9839,9 @@ class Firefox60 extends HandlerInterface_1.HandlerInterface {
             rtcpMuxPolicy: 'require',
             ...additionalSettings
         }, proprietaryConstraints);
+        this._pc.addEventListener('icegatheringstatechange', () => {
+            this.emit('@icegatheringstatechange', this._pc.iceGatheringState);
+        });
         if (this._pc.connectionState) {
             this._pc.addEventListener('connectionstatechange', () => {
                 this.emit('@connectionstatechange', this._pc.connectionState);
@@ -9662,10 +9873,12 @@ class Firefox60 extends HandlerInterface_1.HandlerInterface {
     }
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     async updateIceServers(iceServers) {
+        this.assertNotClosed();
         // NOTE: Firefox does not implement pc.setConfiguration().
         throw new errors_1.UnsupportedError('not supported');
     }
     async restartIce(iceParameters) {
+        this.assertNotClosed();
         logger.debug('restartIce()');
         // Provide the remote SDP handler with new remote ICE parameters.
         this._remoteSdp.updateIceParameters(iceParameters);
@@ -9690,9 +9903,11 @@ class Firefox60 extends HandlerInterface_1.HandlerInterface {
         }
     }
     async getTransportStats() {
+        this.assertNotClosed();
         return this._pc.getStats();
     }
     async send({ track, encodings, codecOptions, codec }) {
+        this.assertNotClosed();
         this.assertSendDirection();
         logger.debug('send() [kind:%s, track.id:%s]', track.kind, track.id);
         if (encodings) {
@@ -9796,7 +10011,11 @@ class Firefox60 extends HandlerInterface_1.HandlerInterface {
         };
     }
     async stopSending(localId) {
+        this.assertSendDirection();
         logger.debug('stopSending() [localId:%s]', localId);
+        if (this._closed) {
+            return;
+        }
         const transceiver = this._mapMidTransceiver.get(localId);
         if (!transceiver) {
             throw new Error('associated transceiver not found');
@@ -9825,6 +10044,7 @@ class Firefox60 extends HandlerInterface_1.HandlerInterface {
     }
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     async pauseSending(localId) {
+        this.assertNotClosed();
         this.assertSendDirection();
         logger.debug('pauseSending() [localId:%s]', localId);
         const transceiver = this._mapMidTransceiver.get(localId);
@@ -9842,6 +10062,7 @@ class Firefox60 extends HandlerInterface_1.HandlerInterface {
     }
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     async resumeSending(localId) {
+        this.assertNotClosed();
         this.assertSendDirection();
         logger.debug('resumeSending() [localId:%s]', localId);
         const transceiver = this._mapMidTransceiver.get(localId);
@@ -9858,6 +10079,7 @@ class Firefox60 extends HandlerInterface_1.HandlerInterface {
         await this._pc.setRemoteDescription(answer);
     }
     async replaceTrack(localId, track) {
+        this.assertNotClosed();
         this.assertSendDirection();
         if (track) {
             logger.debug('replaceTrack() [localId:%s, track.id:%s]', localId, track.id);
@@ -9872,6 +10094,7 @@ class Firefox60 extends HandlerInterface_1.HandlerInterface {
         await transceiver.sender.replaceTrack(track);
     }
     async setMaxSpatialLayer(localId, spatialLayer) {
+        this.assertNotClosed();
         this.assertSendDirection();
         logger.debug('setMaxSpatialLayer() [localId:%s, spatialLayer:%s]', localId, spatialLayer);
         const transceiver = this._mapMidTransceiver.get(localId);
@@ -9900,6 +10123,7 @@ class Firefox60 extends HandlerInterface_1.HandlerInterface {
         await this._pc.setRemoteDescription(answer);
     }
     async setRtpEncodingParameters(localId, params) {
+        this.assertNotClosed();
         this.assertSendDirection();
         logger.debug('setRtpEncodingParameters() [localId:%s, params:%o]', localId, params);
         const transceiver = this._mapMidTransceiver.get(localId);
@@ -9920,6 +10144,7 @@ class Firefox60 extends HandlerInterface_1.HandlerInterface {
         await this._pc.setRemoteDescription(answer);
     }
     async getSenderStats(localId) {
+        this.assertNotClosed();
         this.assertSendDirection();
         const transceiver = this._mapMidTransceiver.get(localId);
         if (!transceiver) {
@@ -9928,6 +10153,7 @@ class Firefox60 extends HandlerInterface_1.HandlerInterface {
         return transceiver.sender.getStats();
     }
     async sendDataChannel({ ordered, maxPacketLifeTime, maxRetransmits, label, protocol }) {
+        this.assertNotClosed();
         this.assertSendDirection();
         const options = {
             negotiated: true,
@@ -9971,6 +10197,7 @@ class Firefox60 extends HandlerInterface_1.HandlerInterface {
     async receive(
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     optionsList) {
+        this.assertNotClosed();
         this.assertRecvDirection();
         const results = [];
         const mapLocalId = new Map();
@@ -10030,6 +10257,9 @@ class Firefox60 extends HandlerInterface_1.HandlerInterface {
     }
     async stopReceiving(localIds) {
         this.assertRecvDirection();
+        if (this._closed) {
+            return;
+        }
         for (const localId of localIds) {
             logger.debug('stopReceiving() [localId:%s]', localId);
             const transceiver = this._mapMidTransceiver.get(localId);
@@ -10049,6 +10279,7 @@ class Firefox60 extends HandlerInterface_1.HandlerInterface {
         }
     }
     async pauseReceiving(localIds) {
+        this.assertNotClosed();
         this.assertRecvDirection();
         for (const localId of localIds) {
             logger.debug('pauseReceiving() [localId:%s]', localId);
@@ -10067,6 +10298,7 @@ class Firefox60 extends HandlerInterface_1.HandlerInterface {
         await this._pc.setLocalDescription(answer);
     }
     async resumeReceiving(localIds) {
+        this.assertNotClosed();
         this.assertRecvDirection();
         for (const localId of localIds) {
             logger.debug('resumeReceiving() [localId:%s]', localId);
@@ -10093,6 +10325,7 @@ class Firefox60 extends HandlerInterface_1.HandlerInterface {
         return transceiver.receiver.getStats();
     }
     async receiveDataChannel({ sctpStreamParameters, label, protocol }) {
+        this.assertNotClosed();
         this.assertRecvDirection();
         const { streamId, ordered, maxPacketLifeTime, maxRetransmits } = sctpStreamParameters;
         const options = {
@@ -10138,6 +10371,11 @@ class Firefox60 extends HandlerInterface_1.HandlerInterface {
             this.safeEmit('@connect', { dtlsParameters }, resolve, reject);
         });
         this._transportReady = true;
+    }
+    assertNotClosed() {
+        if (this._closed) {
+            throw new errors_1.InvalidStateError('method called in a closed handler');
+        }
     }
     assertSendDirection() {
         if (this._direction !== 'send') {
@@ -10314,6 +10552,9 @@ class ReactNative extends HandlerInterface_1.HandlerInterface {
             sdpSemantics: 'plan-b',
             ...additionalSettings
         }, proprietaryConstraints);
+        this._pc.addEventListener('icegatheringstatechange', () => {
+            this.emit('@icegatheringstatechange', this._pc.iceGatheringState);
+        });
         if (this._pc.connectionState) {
             this._pc.addEventListener('connectionstatechange', () => {
                 this.emit('@connectionstatechange', this._pc.connectionState);
@@ -10754,6 +10995,7 @@ const ortc = __importStar(require("../ortc"));
 const sdpCommonUtils = __importStar(require("./sdp/commonUtils"));
 const sdpUnifiedPlanUtils = __importStar(require("./sdp/unifiedPlanUtils"));
 const ortcUtils = __importStar(require("./ortc/utils"));
+const errors_1 = require("../errors");
 const HandlerInterface_1 = require("./HandlerInterface");
 const RemoteSdp_1 = require("./sdp/RemoteSdp");
 const scalabilityModes_1 = require("../scalabilityModes");
@@ -10768,6 +11010,8 @@ class ReactNativeUnifiedPlan extends HandlerInterface_1.HandlerInterface {
     }
     constructor() {
         super();
+        // Closed flag.
+        this._closed = false;
         // Map of RTCTransceivers indexed by MID.
         this._mapMidTransceiver = new Map();
         // Local stream for sending.
@@ -10784,6 +11028,10 @@ class ReactNativeUnifiedPlan extends HandlerInterface_1.HandlerInterface {
     }
     close() {
         logger.debug('close()');
+        if (this._closed) {
+            return;
+        }
+        this._closed = true;
         // Free/dispose native MediaStream but DO NOT free/dispose native
         // MediaStreamTracks (that is parent's business).
         // @ts-ignore (proprietary API in react-native-webrtc).
@@ -10835,6 +11083,7 @@ class ReactNativeUnifiedPlan extends HandlerInterface_1.HandlerInterface {
         };
     }
     run({ direction, iceParameters, iceCandidates, dtlsParameters, sctpParameters, iceServers, iceTransportPolicy, additionalSettings, proprietaryConstraints, extendedRtpCapabilities }) {
+        this.assertNotClosed();
         logger.debug('run()');
         this._direction = direction;
         this._remoteSdp = new RemoteSdp_1.RemoteSdp({
@@ -10866,6 +11115,9 @@ class ReactNativeUnifiedPlan extends HandlerInterface_1.HandlerInterface {
             sdpSemantics: 'unified-plan',
             ...additionalSettings
         }, proprietaryConstraints);
+        this._pc.addEventListener('icegatheringstatechange', () => {
+            this.emit('@icegatheringstatechange', this._pc.iceGatheringState);
+        });
         if (this._pc.connectionState) {
             this._pc.addEventListener('connectionstatechange', () => {
                 this.emit('@connectionstatechange', this._pc.connectionState);
@@ -10896,12 +11148,14 @@ class ReactNativeUnifiedPlan extends HandlerInterface_1.HandlerInterface {
         }
     }
     async updateIceServers(iceServers) {
+        this.assertNotClosed();
         logger.debug('updateIceServers()');
         const configuration = this._pc.getConfiguration();
         configuration.iceServers = iceServers;
         this._pc.setConfiguration(configuration);
     }
     async restartIce(iceParameters) {
+        this.assertNotClosed();
         logger.debug('restartIce()');
         // Provide the remote SDP handler with new remote ICE parameters.
         this._remoteSdp.updateIceParameters(iceParameters);
@@ -10926,9 +11180,11 @@ class ReactNativeUnifiedPlan extends HandlerInterface_1.HandlerInterface {
         }
     }
     async getTransportStats() {
+        this.assertNotClosed();
         return this._pc.getStats();
     }
     async send({ track, encodings, codecOptions, codec }) {
+        this.assertNotClosed();
         this.assertSendDirection();
         logger.debug('send() [kind:%s, track.id:%s]', track.kind, track.id);
         if (encodings && encodings.length > 1) {
@@ -11060,6 +11316,9 @@ class ReactNativeUnifiedPlan extends HandlerInterface_1.HandlerInterface {
     }
     async stopSending(localId) {
         this.assertSendDirection();
+        if (this._closed) {
+            return;
+        }
         logger.debug('stopSending() [localId:%s]', localId);
         const transceiver = this._mapMidTransceiver.get(localId);
         if (!transceiver) {
@@ -11083,6 +11342,7 @@ class ReactNativeUnifiedPlan extends HandlerInterface_1.HandlerInterface {
         this._mapMidTransceiver.delete(localId);
     }
     async pauseSending(localId) {
+        this.assertNotClosed();
         this.assertSendDirection();
         logger.debug('pauseSending() [localId:%s]', localId);
         const transceiver = this._mapMidTransceiver.get(localId);
@@ -11099,6 +11359,7 @@ class ReactNativeUnifiedPlan extends HandlerInterface_1.HandlerInterface {
         await this._pc.setRemoteDescription(answer);
     }
     async resumeSending(localId) {
+        this.assertNotClosed();
         this.assertSendDirection();
         logger.debug('resumeSending() [localId:%s]', localId);
         const transceiver = this._mapMidTransceiver.get(localId);
@@ -11115,6 +11376,7 @@ class ReactNativeUnifiedPlan extends HandlerInterface_1.HandlerInterface {
         await this._pc.setRemoteDescription(answer);
     }
     async replaceTrack(localId, track) {
+        this.assertNotClosed();
         this.assertSendDirection();
         if (track) {
             logger.debug('replaceTrack() [localId:%s, track.id:%s]', localId, track.id);
@@ -11129,6 +11391,7 @@ class ReactNativeUnifiedPlan extends HandlerInterface_1.HandlerInterface {
         await transceiver.sender.replaceTrack(track);
     }
     async setMaxSpatialLayer(localId, spatialLayer) {
+        this.assertNotClosed();
         this.assertSendDirection();
         logger.debug('setMaxSpatialLayer() [localId:%s, spatialLayer:%s]', localId, spatialLayer);
         const transceiver = this._mapMidTransceiver.get(localId);
@@ -11154,6 +11417,7 @@ class ReactNativeUnifiedPlan extends HandlerInterface_1.HandlerInterface {
         await this._pc.setRemoteDescription(answer);
     }
     async setRtpEncodingParameters(localId, params) {
+        this.assertNotClosed();
         this.assertSendDirection();
         logger.debug('setRtpEncodingParameters() [localId:%s, params:%o]', localId, params);
         const transceiver = this._mapMidTransceiver.get(localId);
@@ -11174,6 +11438,7 @@ class ReactNativeUnifiedPlan extends HandlerInterface_1.HandlerInterface {
         await this._pc.setRemoteDescription(answer);
     }
     async getSenderStats(localId) {
+        this.assertNotClosed();
         this.assertSendDirection();
         const transceiver = this._mapMidTransceiver.get(localId);
         if (!transceiver) {
@@ -11182,6 +11447,7 @@ class ReactNativeUnifiedPlan extends HandlerInterface_1.HandlerInterface {
         return transceiver.sender.getStats();
     }
     async sendDataChannel({ ordered, maxPacketLifeTime, maxRetransmits, label, protocol }) {
+        this.assertNotClosed();
         this.assertSendDirection();
         const options = {
             negotiated: true,
@@ -11226,6 +11492,7 @@ class ReactNativeUnifiedPlan extends HandlerInterface_1.HandlerInterface {
         return { dataChannel, sctpStreamParameters };
     }
     async receive(optionsList) {
+        this.assertNotClosed();
         this.assertRecvDirection();
         const results = [];
         const mapLocalId = new Map();
@@ -11290,6 +11557,9 @@ class ReactNativeUnifiedPlan extends HandlerInterface_1.HandlerInterface {
     }
     async stopReceiving(localIds) {
         this.assertRecvDirection();
+        if (this._closed) {
+            return;
+        }
         for (const localId of localIds) {
             logger.debug('stopReceiving() [localId:%s]', localId);
             const transceiver = this._mapMidTransceiver.get(localId);
@@ -11309,6 +11579,7 @@ class ReactNativeUnifiedPlan extends HandlerInterface_1.HandlerInterface {
         }
     }
     async pauseReceiving(localIds) {
+        this.assertNotClosed();
         this.assertRecvDirection();
         for (const localId of localIds) {
             logger.debug('pauseReceiving() [localId:%s]', localId);
@@ -11327,6 +11598,7 @@ class ReactNativeUnifiedPlan extends HandlerInterface_1.HandlerInterface {
         await this._pc.setLocalDescription(answer);
     }
     async resumeReceiving(localIds) {
+        this.assertNotClosed();
         this.assertRecvDirection();
         for (const localId of localIds) {
             logger.debug('resumeReceiving() [localId:%s]', localId);
@@ -11345,6 +11617,7 @@ class ReactNativeUnifiedPlan extends HandlerInterface_1.HandlerInterface {
         await this._pc.setLocalDescription(answer);
     }
     async getReceiverStats(localId) {
+        this.assertNotClosed();
         this.assertRecvDirection();
         const transceiver = this._mapMidTransceiver.get(localId);
         if (!transceiver) {
@@ -11353,6 +11626,7 @@ class ReactNativeUnifiedPlan extends HandlerInterface_1.HandlerInterface {
         return transceiver.receiver.getStats();
     }
     async receiveDataChannel({ sctpStreamParameters, label, protocol }) {
+        this.assertNotClosed();
         this.assertRecvDirection();
         const { streamId, ordered, maxPacketLifeTime, maxRetransmits } = sctpStreamParameters;
         const options = {
@@ -11402,6 +11676,11 @@ class ReactNativeUnifiedPlan extends HandlerInterface_1.HandlerInterface {
         });
         this._transportReady = true;
     }
+    assertNotClosed() {
+        if (this._closed) {
+            throw new errors_1.InvalidStateError('method called in a closed handler');
+        }
+    }
     assertSendDirection() {
         if (this._direction !== 'send') {
             throw new Error('method can just be called for handlers with "send" direction');
@@ -11415,7 +11694,7 @@ class ReactNativeUnifiedPlan extends HandlerInterface_1.HandlerInterface {
 }
 exports.ReactNativeUnifiedPlan = ReactNativeUnifiedPlan;
 
-},{"../Logger":39,"../ortc":65,"../scalabilityModes":66,"../utils":68,"./HandlerInterface":52,"./ortc/utils":58,"./sdp/RemoteSdp":60,"./sdp/commonUtils":61,"./sdp/unifiedPlanUtils":63,"sdp-transform":74}],55:[function(require,module,exports){
+},{"../Logger":39,"../errors":44,"../ortc":65,"../scalabilityModes":66,"../utils":68,"./HandlerInterface":52,"./ortc/utils":58,"./sdp/RemoteSdp":60,"./sdp/commonUtils":61,"./sdp/unifiedPlanUtils":63,"sdp-transform":74}],55:[function(require,module,exports){
 "use strict";
 var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
@@ -11559,6 +11838,9 @@ class Safari11 extends HandlerInterface_1.HandlerInterface {
             rtcpMuxPolicy: 'require',
             ...additionalSettings
         }, proprietaryConstraints);
+        this._pc.addEventListener('icegatheringstatechange', () => {
+            this.emit('@icegatheringstatechange', this._pc.iceGatheringState);
+        });
         if (this._pc.connectionState) {
             this._pc.addEventListener('connectionstatechange', () => {
                 this.emit('@connectionstatechange', this._pc.connectionState);
@@ -12039,6 +12321,7 @@ const ortc = __importStar(require("../ortc"));
 const sdpCommonUtils = __importStar(require("./sdp/commonUtils"));
 const sdpUnifiedPlanUtils = __importStar(require("./sdp/unifiedPlanUtils"));
 const ortcUtils = __importStar(require("./ortc/utils"));
+const errors_1 = require("../errors");
 const HandlerInterface_1 = require("./HandlerInterface");
 const RemoteSdp_1 = require("./sdp/RemoteSdp");
 const scalabilityModes_1 = require("../scalabilityModes");
@@ -12053,6 +12336,8 @@ class Safari12 extends HandlerInterface_1.HandlerInterface {
     }
     constructor() {
         super();
+        // Closed flag.
+        this._closed = false;
         // Map of RTCTransceivers indexed by MID.
         this._mapMidTransceiver = new Map();
         // Local stream for sending.
@@ -12069,6 +12354,10 @@ class Safari12 extends HandlerInterface_1.HandlerInterface {
     }
     close() {
         logger.debug('close()');
+        if (this._closed) {
+            return;
+        }
+        this._closed = true;
         // Close RTCPeerConnection.
         if (this._pc) {
             try {
@@ -12115,6 +12404,7 @@ class Safari12 extends HandlerInterface_1.HandlerInterface {
         };
     }
     run({ direction, iceParameters, iceCandidates, dtlsParameters, sctpParameters, iceServers, iceTransportPolicy, additionalSettings, proprietaryConstraints, extendedRtpCapabilities }) {
+        this.assertNotClosed();
         logger.debug('run()');
         this._direction = direction;
         this._remoteSdp = new RemoteSdp_1.RemoteSdp({
@@ -12145,6 +12435,9 @@ class Safari12 extends HandlerInterface_1.HandlerInterface {
             rtcpMuxPolicy: 'require',
             ...additionalSettings
         }, proprietaryConstraints);
+        this._pc.addEventListener('icegatheringstatechange', () => {
+            this.emit('@icegatheringstatechange', this._pc.iceGatheringState);
+        });
         if (this._pc.connectionState) {
             this._pc.addEventListener('connectionstatechange', () => {
                 this.emit('@connectionstatechange', this._pc.connectionState);
@@ -12175,12 +12468,14 @@ class Safari12 extends HandlerInterface_1.HandlerInterface {
         }
     }
     async updateIceServers(iceServers) {
+        this.assertNotClosed();
         logger.debug('updateIceServers()');
         const configuration = this._pc.getConfiguration();
         configuration.iceServers = iceServers;
         this._pc.setConfiguration(configuration);
     }
     async restartIce(iceParameters) {
+        this.assertNotClosed();
         logger.debug('restartIce()');
         // Provide the remote SDP handler with new remote ICE parameters.
         this._remoteSdp.updateIceParameters(iceParameters);
@@ -12205,9 +12500,11 @@ class Safari12 extends HandlerInterface_1.HandlerInterface {
         }
     }
     async getTransportStats() {
+        this.assertNotClosed();
         return this._pc.getStats();
     }
     async send({ track, encodings, codecOptions, codec }) {
+        this.assertNotClosed();
         this.assertSendDirection();
         logger.debug('send() [kind:%s, track.id:%s]', track.kind, track.id);
         const sendingRtpParameters = utils.clone(this._sendingRtpParametersByKind[track.kind], {});
@@ -12296,6 +12593,9 @@ class Safari12 extends HandlerInterface_1.HandlerInterface {
     }
     async stopSending(localId) {
         this.assertSendDirection();
+        if (this._closed) {
+            return;
+        }
         logger.debug('stopSending() [localId:%s]', localId);
         const transceiver = this._mapMidTransceiver.get(localId);
         if (!transceiver) {
@@ -12320,6 +12620,7 @@ class Safari12 extends HandlerInterface_1.HandlerInterface {
     }
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     async pauseSending(localId) {
+        this.assertNotClosed();
         this.assertSendDirection();
         logger.debug('pauseSending() [localId:%s]', localId);
         const transceiver = this._mapMidTransceiver.get(localId);
@@ -12337,6 +12638,7 @@ class Safari12 extends HandlerInterface_1.HandlerInterface {
     }
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     async resumeSending(localId) {
+        this.assertNotClosed();
         this.assertSendDirection();
         logger.debug('resumeSending() [localId:%s]', localId);
         const transceiver = this._mapMidTransceiver.get(localId);
@@ -12353,6 +12655,7 @@ class Safari12 extends HandlerInterface_1.HandlerInterface {
         await this._pc.setRemoteDescription(answer);
     }
     async replaceTrack(localId, track) {
+        this.assertNotClosed();
         this.assertSendDirection();
         if (track) {
             logger.debug('replaceTrack() [localId:%s, track.id:%s]', localId, track.id);
@@ -12367,6 +12670,7 @@ class Safari12 extends HandlerInterface_1.HandlerInterface {
         await transceiver.sender.replaceTrack(track);
     }
     async setMaxSpatialLayer(localId, spatialLayer) {
+        this.assertNotClosed();
         this.assertSendDirection();
         logger.debug('setMaxSpatialLayer() [localId:%s, spatialLayer:%s]', localId, spatialLayer);
         const transceiver = this._mapMidTransceiver.get(localId);
@@ -12392,6 +12696,7 @@ class Safari12 extends HandlerInterface_1.HandlerInterface {
         await this._pc.setRemoteDescription(answer);
     }
     async setRtpEncodingParameters(localId, params) {
+        this.assertNotClosed();
         this.assertSendDirection();
         logger.debug('setRtpEncodingParameters() [localId:%s, params:%o]', localId, params);
         const transceiver = this._mapMidTransceiver.get(localId);
@@ -12412,6 +12717,7 @@ class Safari12 extends HandlerInterface_1.HandlerInterface {
         await this._pc.setRemoteDescription(answer);
     }
     async getSenderStats(localId) {
+        this.assertNotClosed();
         this.assertSendDirection();
         const transceiver = this._mapMidTransceiver.get(localId);
         if (!transceiver) {
@@ -12420,6 +12726,7 @@ class Safari12 extends HandlerInterface_1.HandlerInterface {
         return transceiver.sender.getStats();
     }
     async sendDataChannel({ ordered, maxPacketLifeTime, maxRetransmits, label, protocol }) {
+        this.assertNotClosed();
         this.assertSendDirection();
         const options = {
             negotiated: true,
@@ -12464,6 +12771,7 @@ class Safari12 extends HandlerInterface_1.HandlerInterface {
         return { dataChannel, sctpStreamParameters };
     }
     async receive(optionsList) {
+        this.assertNotClosed();
         this.assertRecvDirection();
         const results = [];
         const mapLocalId = new Map();
@@ -12526,6 +12834,9 @@ class Safari12 extends HandlerInterface_1.HandlerInterface {
     }
     async stopReceiving(localIds) {
         this.assertRecvDirection();
+        if (this._closed) {
+            return;
+        }
         for (const localId of localIds) {
             logger.debug('stopReceiving() [localId:%s]', localId);
             const transceiver = this._mapMidTransceiver.get(localId);
@@ -12545,6 +12856,7 @@ class Safari12 extends HandlerInterface_1.HandlerInterface {
         }
     }
     async pauseReceiving(localIds) {
+        this.assertNotClosed();
         this.assertRecvDirection();
         for (const localId of localIds) {
             logger.debug('pauseReceiving() [localId:%s]', localId);
@@ -12563,6 +12875,7 @@ class Safari12 extends HandlerInterface_1.HandlerInterface {
         await this._pc.setLocalDescription(answer);
     }
     async resumeReceiving(localIds) {
+        this.assertNotClosed();
         this.assertRecvDirection();
         for (const localId of localIds) {
             logger.debug('resumeReceiving() [localId:%s]', localId);
@@ -12581,6 +12894,7 @@ class Safari12 extends HandlerInterface_1.HandlerInterface {
         await this._pc.setLocalDescription(answer);
     }
     async getReceiverStats(localId) {
+        this.assertNotClosed();
         this.assertRecvDirection();
         const transceiver = this._mapMidTransceiver.get(localId);
         if (!transceiver) {
@@ -12589,6 +12903,7 @@ class Safari12 extends HandlerInterface_1.HandlerInterface {
         return transceiver.receiver.getStats();
     }
     async receiveDataChannel({ sctpStreamParameters, label, protocol }) {
+        this.assertNotClosed();
         this.assertRecvDirection();
         const { streamId, ordered, maxPacketLifeTime, maxRetransmits } = sctpStreamParameters;
         const options = {
@@ -12638,6 +12953,11 @@ class Safari12 extends HandlerInterface_1.HandlerInterface {
         });
         this._transportReady = true;
     }
+    assertNotClosed() {
+        if (this._closed) {
+            throw new errors_1.InvalidStateError('method called in a closed handler');
+        }
+    }
     assertSendDirection() {
         if (this._direction !== 'send') {
             throw new Error('method can just be called for handlers with "send" direction');
@@ -12651,7 +12971,7 @@ class Safari12 extends HandlerInterface_1.HandlerInterface {
 }
 exports.Safari12 = Safari12;
 
-},{"../Logger":39,"../ortc":65,"../scalabilityModes":66,"../utils":68,"./HandlerInterface":52,"./ortc/utils":58,"./sdp/RemoteSdp":60,"./sdp/commonUtils":61,"./sdp/unifiedPlanUtils":63,"sdp-transform":74}],57:[function(require,module,exports){
+},{"../Logger":39,"../errors":44,"../ortc":65,"../scalabilityModes":66,"../utils":68,"./HandlerInterface":52,"./ortc/utils":58,"./sdp/RemoteSdp":60,"./sdp/commonUtils":61,"./sdp/unifiedPlanUtils":63,"sdp-transform":74}],57:[function(require,module,exports){
 "use strict";
 var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
@@ -14211,7 +14531,7 @@ exports.types = types;
 /**
  * Expose mediasoup-client version.
  */
-exports.version = '3.6.93';
+exports.version = '3.6.98';
 /**
  * Expose parseScalabilityMode() function.
  */

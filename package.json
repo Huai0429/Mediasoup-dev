@@ -14,10 +14,10 @@
   "dependencies": {
     "express": "^4.18.2",
     "httpolyglot": "^0.1.2",
-    "mediasoup": "^3.12.4",
-    "mediasoup-client": "^3.6.93",
-    "socket.io": "^4.7.1",
-    "socket.io-client": "^4.7.1"
+    "mediasoup": "^3.12.10",
+    "mediasoup-client": "^3.6.98",
+    "socket.io": "^4.7.2",
+    "socket.io-client": "^4.7.2"
   },
   "devDependencies": {
     "nodemon": "^2.0.22"
